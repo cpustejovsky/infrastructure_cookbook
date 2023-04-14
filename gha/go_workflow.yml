@@ -1,0 +1,267 @@
+---
+name: CI/CD Workflow
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+env:
+  GO_VERSION: 1.19
+  DOCKERFILE_PATH: ./zarf/docker/dockerfile
+  DOCKER_IMAGE: cpustejovsky/mongotest
+
+
+jobs:
+  # FIRST JOB #######################################################################
+  test-unit-go:
+    name: Go Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Build
+        run: go build -v ./...
+
+      - name: Test
+        run: go test -v -short ./...
+
+  # NEXT JOB #######################################################################
+  test-integration-go:
+    name: Go Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Integration Test
+        run: |
+          docker compose -f zarf/docker/docker-compose.mongo.yml up -d
+          go test ./... -v
+          docker compose -f zarf/docker/docker-compose.mongo.yml down
+
+  # NEXT JOB #######################################################################
+  build-test-image:
+    # calling a specific action
+    name: Build Image for Testing
+    needs: [ test-integration-go, test-unit-go ]
+    runs-on: ubuntu-latest
+    # set up secure by default by only giving manual R/W permissions
+    permissions:
+      packages: write # needed to push docker image to ghcr.io
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          # secrets stored on GitHub
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      # can potentially use multiple container repos for different purposes
+      - name: Login to ghcr.io registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push to GHCR
+        uses: docker/build-push-action@v4
+        with:
+          path: $DOCKERFILE_PATH
+          push: true
+          # custom tag based on randomly generated GitHub run ID
+          tags: ghcr.io/${{ env.DOCKER_IMAGE }}:${{ github.run_id }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+  # NEXT JOB #######################################################################
+  test-integration-docker:
+    name: Docker Integration Test
+    needs: [ build-test-image ]
+    runs-on: ubuntu-latest
+
+    permissions:
+      packages: read
+
+    steps:
+
+      - name: Checkout git repo
+        uses: actions/checkout@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to ghcr.io registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Test healthcheck in Docker Compose
+        run: |
+          export TESTING_IMAGE=ghcr.io/"$DOCKER_IMAGE":"$GITHUB_RUN_ID"
+          echo Testing image: "$TESTING_IMAGE"
+          docker compose -f zarf/docker/docker-compose.test.yml up --exit-code-from sut
+
+  # NEXT JOB #######################################################################
+  test-k3d:
+    name: Test Deployment in Kubernetes
+    needs: [ build-test-image ]
+    runs-on: ubuntu-latest
+
+    permissions:
+      packages: read
+
+    steps:
+
+      - name: Checkout git repo
+        uses: actions/checkout@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to ghcr.io registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # runs k3s for testing purposes
+      - uses: AbsaOSS/k3d-action@v2
+        with:
+          cluster-name: "test-cluster-1"
+          args: >-
+            -p "3000:80@agent:0:direct"
+            --agents 1
+            --no-lb
+            --k3s-arg "--no-deploy=traefik,servicelb,metrics-server@server:*"
+
+      - name: Smoke test deployment in k3d Kubernetes
+        run: |
+          kubectl create secret docker-registry regcred \
+            --docker-server=https://ghcr.io \
+            --docker-username=${{ github.actor }} \
+            --docker-password=${{ secrets.GITHUB_TOKEN }}
+          export TESTING_IMAGE=ghcr.io/"$DOCKER_IMAGE":"$GITHUB_RUN_ID"
+          envsubst < zarf/k8s/manifests/deployment.yaml  | kubectl apply -f -
+          kubectl rollout status deployment myapp
+          kubectl exec deploy/myapp -- curl --fail http://localhost:3000
+
+  # NEXT JOB #######################################################################
+  scan-image:
+    name: Scan Image with Trivy
+    needs: [ build-test-image ]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read # for actions/checkout to fetch code
+      packages: read # needed to pull docker image to ghcr.io
+      security-events: write # for github/codeql-action/upload-sarif to upload SARIF results
+
+    steps:
+
+      - name: Checkout git repo
+        uses: actions/checkout@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to ghcr.io registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image to scan
+        run: docker pull ghcr.io/"$DOCKER_IMAGE":"$GITHUB_RUN_ID"
+      # like Snyk
+      - name: Run Trivy for all CVEs (non-blocking)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ghcr.io/${{ env.DOCKER_IMAGE }}:${{ github.run_id }}
+          format: table
+          exit-code: 0
+
+  # NEXT JOB #######################################################################
+  build-final-image:
+    name: Build Final Image
+    needs: [ test-integration-docker, test-k3d, scan-image ]
+    runs-on: ubuntu-latest
+
+    permissions:
+      packages: write # needed to push docker image to ghcr.io
+      pull-requests: write # needed to create and update comments in PRs
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      # enables building multi-platform
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+      # enables caching
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to ghcr.io registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # see documentation for more info: https://github.com/docker/metadata-action
+      - name: Docker Metadata for Final Image Build
+        id: docker_meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.DOCKER_IMAGE }},ghcr.io/${{ env.DOCKER_IMAGE }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=99
+
+      - name: Docker Build and Push to GHCR and Docker Hub
+        uses: docker/build-push-action@v4
+        with:
+          push: true
+          path: $DOCKERFILE_PATH
+          tags: ${{ steps.docker_meta.outputs.tags }}
+          labels: ${{ steps.docker_meta.outputs.labels }}
+          # enabled by buildx
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
